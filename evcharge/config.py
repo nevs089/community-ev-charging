@@ -1,6 +1,7 @@
 """Settings, read from the environment (compose.yml's env_file)."""
 from __future__ import annotations
 
+import ipaddress
 import os
 import re
 from dataclasses import dataclass, field
@@ -109,6 +110,9 @@ class Settings:
     page_note: str = ""
     # "card": only PayPal's guest card checkout (1.2% + 30p); "all": PayPal accounts too (2.9% + 30p).
     payment_methods: str = "card"
+    # Networks besides RFC 1918 and loopback that count as "on the site's network" for the
+    # admin pages, /api and plain ws:// chargers, e.g. ("100.64.0.0/10",) for Tailscale.
+    trusted_nets: tuple[str, ...] = ()
 
     def __post_init__(self):
         if self.hold_default is None:
@@ -275,6 +279,7 @@ def from_env(env: dict[str, str] | None = None) -> Settings:
         tls_check_addr=env.get("TLS_CHECK_ADDR", "").strip() or env.get("TLS_CHECK", "").strip(),
         tls_check_port=int(env.get("TLS_CHECK_PORT", d.tls_check_port)),
         display_prices=env.get("DISPLAY_PRICES", d.display_prices),
+        trusted_nets=tuple(n.strip() for n in env.get("TRUSTED_NETS", "").split(",") if n.strip()),
     )
     unknown = set(s.sockets) - set(s.connectors)
     if unknown:
@@ -304,6 +309,11 @@ def from_env(env: dict[str, str] | None = None) -> Settings:
         raise ValueError("STRIPE_SECRET_KEY must be a secret (sk_...) or restricted (rk_...) key")
     if s.stripe_webhook_secret and not s.stripe_webhook_secret.startswith("whsec_"):
         raise ValueError("STRIPE_WEBHOOK_SECRET must start with whsec_")
+    for net in s.trusted_nets:
+        try:
+            ipaddress.ip_network(net)
+        except ValueError:
+            raise ValueError(f"TRUSTED_NETS entry {net!r} is not a network like 100.64.0.0/10") from None
     if not re.fullmatch(r"[A-Z]{3}", s.currency):
         raise ValueError("CURRENCY must be a three-letter code such as GBP or EUR")
     return s

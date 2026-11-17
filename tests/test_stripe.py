@@ -445,3 +445,33 @@ def test_webhook_not_configured(tmp_path, fake):
     s = Settings(db_path=str(tmp_path / "n.db"), **{**STRIPE, "stripe_webhook_secret": ""})
     with TestClient(create_app(s, stripe=Stripe(s, transport=httpx.MockTransport(fake)))) as c:
         assert c.post("/webhooks/stripe", json={}).status_code == 503
+
+
+# -- site settings used by the Home Assistant add-on --------------------------------
+
+def test_trusted_networks(tmp_path):
+    from evcharge import csms as csms_mod
+    s = from_env({"TRUSTED_NETS": "100.64.0.0/10", "DB_PATH": str(tmp_path / "t.db")})
+    assert s.trusted_nets == ("100.64.0.0/10",)
+    assert not csms_mod._is_private("100.101.102.103")
+    try:
+        db = DB(s.db_path)
+        csms_mod.CSMS(s, db, Payments(s, db, PayPal(s)))
+        assert csms_mod._is_private("100.101.102.103") and not csms_mod._is_private("8.8.8.8")
+    finally:
+        csms_mod.TRUSTED_NETS.clear()
+    with pytest.raises(ValueError):
+        from_env({"TRUSTED_NETS": "tailscale"})
+
+
+def test_site_timezone_from_the_environment():
+    import os
+    import subprocess
+    import sys
+    code = "from evcharge import tariff; print(tariff.TZ)"
+    env = {**os.environ, "SITE_TIMEZONE": "Europe/Madrid"}
+    out = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, check=True)
+    assert out.stdout.strip() == "Europe/Madrid"
+    env.pop("SITE_TIMEZONE")
+    out = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, check=True)
+    assert out.stdout.strip() == "Europe/London"

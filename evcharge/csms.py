@@ -336,6 +336,7 @@ class CSMS:
         self.settings = settings
         self.db = db
         self.payments = payments
+        TRUSTED_NETS[:] = [ipaddress.ip_network(n) for n in settings.trusted_nets]
         self.points: dict[str, ChargePoint] = {}     # or csms201.ChargePoint201
         self.status: dict[tuple[str, int], str] = {}
         # Per charge point: vendor, model, firmware, serial (from BootNotification), last_seen.
@@ -737,6 +738,9 @@ def parse_signal(value: str) -> dict[str, int]:
 
 PRIVATE_NETS = [ipaddress.ip_network(n) for n in
                 ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8", "::1/128")]
+# Extra networks treated like the LAN (TRUSTED_NETS), e.g. Tailscale's 100.64.0.0/10 so the
+# admin pages work over the VPN. Set from the settings when the CSMS starts.
+TRUSTED_NETS: list = []
 
 
 def _is_private(address: str) -> bool:
@@ -747,7 +751,7 @@ def _is_private(address: str) -> bool:
         return False
     if getattr(ip, "ipv4_mapped", None):
         ip = ip.ipv4_mapped
-    return any(ip in net for net in PRIVATE_NETS)
+    return any(ip in net for net in (*PRIVATE_NETS, *TRUSTED_NETS))
 
 
 def _cf_scheme(headers) -> str:

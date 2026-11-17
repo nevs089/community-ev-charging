@@ -12,12 +12,14 @@ from __future__ import annotations
 
 import json
 import re
+import os
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal
 from zoneinfo import ZoneInfo
 
-TZ = "Europe/London"
+# The site's local time: tariff bands, solar periods and the dates on the admin pages.
+TZ = os.environ.get("SITE_TIMEZONE") or "Europe/London"
 SOLAR = "solar"
 FEE = "fee"
 _BAND = re.compile(r"^(?P<name>[a-z][a-z0-9_-]*)\s+(?P<start>\d\d:\d\d)-(?P<end>\d\d:\d\d)\s+(?P<price>\d+(\.\d+)?)$")
