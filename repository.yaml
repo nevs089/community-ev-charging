@@ -1,0 +1,5 @@
+# Home Assistant add-on repository: add https://github.com/nevs089/community-ev-charging#stripe-provider
+# under Settings → Add-ons → Add-on Store → ⋮ → Repositories.
+name: community-ev-charging (Stripe fork)
+url: https://github.com/nevs089/community-ev-charging
+maintainer: nevs089

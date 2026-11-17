@@ -1,0 +1,75 @@
+name: EV Charging (Stripe)
+version: "0.1.0"
+slug: evcharge
+description: OCPP central system with Stripe card payment for EV charging, pay per kWh
+url: https://github.com/nevs089/community-ev-charging
+arch:
+  - amd64
+  - aarch64
+startup: application
+boot: auto
+init: false
+backup: hot
+# A logo for the pay pages can go in /share/evcharge/ (brand_logo: its file name).
+map:
+  - share:ro
+ports:
+  9000/tcp: 9000
+  8080/tcp: 8081
+ports_description:
+  9000/tcp: OCPP - the charger connects here (ws://<host>:9000/)
+  8080/tcp: Pay pages, /admin and /api on the LAN (the public side goes through Cloudflared)
+options:
+  stripe_secret_key: ""
+  stripe_webhook_secret: ""
+  currency: EUR
+  price_per_kwh: "0.40"
+  session_fee: "0"
+  hold_options: "50"
+  public_url: ""
+  socket_name: CP1
+  charge_point_id: ""
+  socket_kw: 7
+  ocpp_allow_ws: true
+  ocpp_password: ""
+  admin_password: ""
+  api_token: ""
+  timezone: Europe/Madrid
+  trusted_networks: "100.64.0.0/10"
+  brand_name: ""
+  brand_color: "#1f5f7a"
+  brand_logo: ""
+  footer_text: ""
+  page_note: ""
+  support_contact: ""
+  statement_name: ""
+  receipts_smtp_user: ""
+  receipts_smtp_password: ""
+  receipts_mail_from: ""
+schema:
+  stripe_secret_key: password?
+  stripe_webhook_secret: password?
+  currency: match(^[A-Z]{3}$)
+  price_per_kwh: match(^[0-9]+(\.[0-9]+)?$)
+  session_fee: match(^[0-9]+(\.[0-9]+)?$)
+  hold_options: match(^[0-9]+(\.[0-9]+)?( *, *[0-9]+(\.[0-9]+)?)*$)
+  public_url: match(^(https://[a-z0-9.-]+)?$)
+  socket_name: match(^[A-Za-z0-9_-]{1,20}$)
+  charge_point_id: match(^[A-Za-z0-9_.-]{0,48}$)
+  socket_kw: int(1,350)
+  ocpp_allow_ws: bool
+  ocpp_password: password?
+  admin_password: password?
+  api_token: password?
+  timezone: str
+  trusted_networks: str?
+  brand_name: str?
+  brand_color: match(^#[0-9a-fA-F]{6}$)
+  brand_logo: str?
+  footer_text: str?
+  page_note: str?
+  support_contact: str?
+  statement_name: str?
+  receipts_smtp_user: str?
+  receipts_smtp_password: password?
+  receipts_mail_from: str?
