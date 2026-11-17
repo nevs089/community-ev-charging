@@ -17,6 +17,7 @@ from . import config
 from .db import DB
 from .payments import PaymentError, Payments
 from .paypal import PayPal
+from .stripe import Stripe
 
 COLS = ("id", "connector", "status", "energy_wh", "amount_charged", "created_at", "error")
 
@@ -37,7 +38,7 @@ def main(argv: list[str] | None = None) -> int:
 
     settings = config.from_env()
     db = DB(settings.db_path)
-    payments = Payments(settings, db, PayPal(settings))
+    payments = Payments(settings, db, PayPal(settings), Stripe(settings))
     try:
         if args.cmd == "list":
             for s in db.recent_sessions():

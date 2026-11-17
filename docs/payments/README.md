@@ -1,12 +1,12 @@
 # Payments
 
-One page per payment provider. PayPal is the only one implemented so far;
-this directory exists so adding another doesn't mean rewriting the docs.
+One page per payment provider. Choose one with `PAYMENT_PROVIDER` (`paypal`, the
+default, or `stripe`).
 
 | Provider | Status | Notes |
 |---|---|---|
 | [PayPal](paypal.md) | implemented | Checkout, `AUTHORIZE` then partial capture. Card-only guest checkout by default. |
-| Stripe | not implemented | Payment Intents with `capture_method=manual` is the same shape and should fit the existing `Payments` interface. |
+| [Stripe](stripe.md) | implemented | Checkout with Payment Intents `capture_method=manual`, partial capture. Cards incl. Apple Pay / Google Pay. `PAYMENT_PROVIDER=stripe`. |
 
 ## What a provider has to be able to do
 

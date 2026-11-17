@@ -40,6 +40,7 @@ READY = "Preparing"
 
 
 def add_admin(app: FastAPI, settings: Settings, db: DB, payments: Payments, csms: CSMS, page) -> None:
+    money = settings.money
 
     def guard(request: Request) -> None:
         if not settings.admin_password:
@@ -146,12 +147,12 @@ stops at the limit. The session is priced at the tariff for the records.</p>
 <form method="post" action="/admin/authorise" class=admin>
  <label>Socket <select name="socket">{options}</select></label>
  <label>Limit <input name="amount" inputmode="decimal" required size=6>
-  <select name="unit"><option value="kwh">kWh</option><option value="gbp">£</option></select></label>
+  <select name="unit"><option value="kwh">kWh</option><option value="gbp">{html.escape(settings.currency_symbol or settings.currency)}</option></select></label>
  <label>For / why <input name="note" maxlength=200 size=28 placeholder="e.g. minister's car"></label>
  <button type="submit">Authorise and start</button>
 </form>
-<h2>Charging now</h2>{_sessions_table(db, active, stop=True) if active else "<p class=small>Nothing.</p>"}
-<h2>Recent</h2>{_sessions_table(db, db.charges(limit=10))}
+<h2>Charging now</h2>{_sessions_table(db, active, stop=True, money=money) if active else "<p class=small>Nothing.</p>"}
+<h2>Recent</h2>{_sessions_table(db, db.charges(limit=10), money=money)}
 <p><a href="/admin/charges">All charges, totals and CSV →</a></p>"""
         return admin_page("Admin", body, refresh=30)
 
@@ -167,12 +168,12 @@ stops at the limit. The session is priced at the tariff for the records.</p>
         csv_link = f'/admin/charges.csv{"?month=" + month if month else ""}'
         body = f"""<p class=small>{everything}{" · " + months if months else ""}</p>
 <table class=sessions>
-<tr><td>Paid charges</td><td>{t["paid_n"]}</td><td>{t["paid_kwh"]:.2f} kWh</td><td>£{t["paid_gross"]:.2f} taken, £{t["paid_fee"]:.2f} PayPal fees, £{t["paid_gross"] - t["paid_fee"]:.2f} net</td></tr>
-<tr><td>Free charges</td><td>{t["free_n"]}</td><td>{t["free_kwh"]:.2f} kWh</td><td>worth £{t["free_value"]:.2f} at the tariff</td></tr>
+<tr><td>Paid charges</td><td>{t["paid_n"]}</td><td>{t["paid_kwh"]:.2f} kWh</td><td>{money(t["paid_gross"])} taken, {money(t["paid_fee"])} {settings.provider_name} fees, {money(t["paid_gross"] - t["paid_fee"])} net</td></tr>
+<tr><td>Free charges</td><td>{t["free_n"]}</td><td>{t["free_kwh"]:.2f} kWh</td><td>worth {money(t["free_value"])} at the tariff</td></tr>
 <tr><td>Other</td><td>{t["other_n"]}</td><td colspan=2 class=small>holds released, failed, or still running</td></tr>
 </table>
 <p><a href="{csv_link}">Download CSV</a></p>
-<h2>{_month_name(month) if month else "All charges"}</h2>{_sessions_table(db, rows) if rows else "<p class=small>None.</p>"}"""
+<h2>{_month_name(month) if month else "All charges"}</h2>{_sessions_table(db, rows, money=money) if rows else "<p class=small>None.</p>"}"""
         return admin_page("Charges", body)
 
     @app.get("/admin/charges.csv", dependencies=[Depends(guard)])
@@ -194,7 +195,7 @@ stops at the limit. The session is priced at the tariff for the records.</p>
                 f"{charged:.2f}" if charged is not None else "", f"{fee:.2f}" if fee is not None else "",
                 f"{charged - fee:.2f}" if charged is not None and fee is not None else "",
                 f"{value:.2f}" if value is not None else "",
-                parts.get("fee", {}).get("cost", ""), s["paypal_capture_id"] or "",
+                parts.get("fee", {}).get("cost", ""), s["paypal_capture_id"] or s["stripe_payment_intent_id"] or "",
                 f"{settings.invoice_prefix}{s['id']}" if s["paypal_capture_id"] else "", s["note"] or "", s["id"],
             ])
         name = f"ev-charges-{month or 'all'}.csv"
@@ -284,7 +285,7 @@ stops at the limit. The session is priced at the tariff for the records.</p>
     @app.post("/admin/authorise", dependencies=[Depends(guard)])
     async def authorise(socket: str = Form(...), amount: str = Form(...), unit: str = Form(...), note: str = Form("")):
         try:
-            value = Decimal(amount.strip().lstrip("£"))
+            value = Decimal(amount.strip().lstrip("£€$").replace(",", "."))
         except InvalidOperation:
             return _back("That amount isn't a number.")
         if csms.socket_state(socket) != READY:
@@ -298,7 +299,7 @@ stops at the limit. The session is priced at the tariff for the records.</p>
         if not await csms.remote_start(s):
             await asyncio.to_thread(payments.cancel, s["id"], "charger did not accept the start")
             return _back(f"The charger didn't start on {socket}; nothing was authorised.")
-        return _back(f"Started {socket}: {value} {'kWh' if unit == 'kwh' else '£'}.")
+        return _back(f"Started {socket}: {value} kWh." if unit == "kwh" else f"Started {socket}: {money(value)}.")
 
     @app.post("/admin/sessions/{sid}/stop", dependencies=[Depends(guard)])
     async def stop(sid: str):
@@ -363,24 +364,24 @@ def _back(msg: str) -> RedirectResponse:
     return RedirectResponse(f"/admin?msg={quote(msg)}", status_code=303)
 
 
-def _sessions_table(db: DB, sessions: list[dict], stop: bool = False) -> str:
+def _sessions_table(db: DB, sessions: list[dict], money, stop: bool = False) -> str:
     rows = []
     for s in sessions:
         value = _energy_value(s) if s["breakdown"] else None
         if s["payment_method"] == "manual":
-            limit = f"{s['limit_wh'] / 1000:g} kWh" if s["limit_wh"] else f"£{s['hold_amount']}"
-            money = f"free ({limit} limit)" + (f", worth £{value:.2f}" if value is not None else "")
+            limit = f"{s['limit_wh'] / 1000:g} kWh" if s["limit_wh"] else money(s["hold_amount"])
+            amount = f"free ({limit} limit)" + (f", worth {money(value)}" if value is not None else "")
         else:
-            money = f"£{s['amount_charged']}" if s["amount_charged"] else f"held £{s['hold_amount']}"
+            amount = money(s["amount_charged"]) if s["amount_charged"] else f"held {money(s['hold_amount'])}"
             if s["paypal_fee"]:
-                money += f" (fee £{s['paypal_fee']})"
+                amount += f" (fee {money(s['paypal_fee'])})"
         energy = f"{s['energy_wh'] / 1000:.2f} kWh" if s["energy_wh"] is not None else ""
         button = (f'<form method="post" action="/admin/sessions/{s["id"]}/stop" style="margin:0">'
                   '<button class=small>Stop</button></form>') if stop else ""
         rows.append(
             f"<tr><td class=small>{html.escape(_local(s['authorized_at'] or s['created_at'])[5:])}</td>"
             f"<td>{html.escape(s['connector'])}</td><td>{html.escape(s['status'].lower())}</td>"
-            f"<td>{energy}</td><td>{html.escape(money)}</td><td class=small>{html.escape(s['note'] or '')}</td>"
+            f"<td>{energy}</td><td>{html.escape(amount)}</td><td class=small>{html.escape(s['note'] or '')}</td>"
             f"<td>{button}</td></tr>")
     return f"<table class=sessions>{''.join(rows)}</table>"
 

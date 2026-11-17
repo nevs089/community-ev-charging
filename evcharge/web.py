@@ -1,6 +1,7 @@
-"""Public web side: pay pages, PayPal button endpoints, PayPal webhook.
+"""Public web side: pay pages, PayPal button endpoints or the Stripe Checkout redirect,
+and the providers' webhooks.
 
-Only /, /pay/*, /static/* and /webhooks/paypal reach this through the tunnel
+Only /, /pay/*, /static/*, /webhooks/paypal and /webhooks/stripe reach this through the tunnel
 (deploy/cloudflared/config.yml.example), so nothing here may be admin-only.
 
 Run: uvicorn --factory evcharge.web:create_app
@@ -19,7 +20,7 @@ from urllib.parse import quote
 from datetime import datetime, timezone
 from decimal import Decimal
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, Form, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 from pydantic import BaseModel
 
@@ -29,6 +30,7 @@ from .csms import CSMS, OFFLINE
 from .db import DB
 from .payments import PaymentError, Payments, session_tariff
 from .paypal import PayPal, PayPalError
+from .stripe import Stripe, verify_signature
 from .tariff import FEE, SOLAR, Tariff
 
 log = logging.getLogger(__name__)
@@ -40,7 +42,7 @@ try { const s = localStorage.getItem("evcharge.session");
     p.firstChild.href = "/pay/session/" + encodeURIComponent(s); p.hidden = false; } } catch (e) {}
 </script>"""
 RATE_RULE = "<p>Each kWh is charged at the rate in force when it is delivered.</p>"
-HOW_IT_WORKS = """<p>PayPal holds an amount while you charge. When you finish, you pay only for
+HOW_IT_WORKS = """<p>{who} holds an amount while you charge. When you finish, you pay only for
 the energy used and the rest is released. Charging stops if the cost reaches
 the amount held.</p>"""
 NO_DATA = "We keep no payment or personal data."
@@ -48,12 +50,16 @@ NO_DATA = "We keep no payment or personal data."
 # until the charge is paid for. Saying so plainly is the point: a driver should
 # not have to discover it from an email they were not told to expect.
 NO_DATA_RECEIPT = ("We keep no payment details. You will get one receipt by email, to the address "
-                   "you give PayPal; we delete it once your charge is paid for, and use it for "
+                   "you give {provider}; we delete it once your charge is paid for, and use it for "
                    "nothing else.")
 
 
 def _privacy(settings) -> str:
-    return NO_DATA_RECEIPT if settings.receipts_enabled else NO_DATA
+    return NO_DATA_RECEIPT.format(provider=settings.provider_name) if settings.receipts_enabled else NO_DATA
+
+
+def _how_it_works(settings) -> str:
+    return HOW_IT_WORKS.format(who="PayPal" if settings.payment_provider == "paypal" else "Your card")
 PROJECT_URL = "https://github.com/JR4AA/community-ev-charging"
 POWERED_BY = (f'<p class="small powered">Powered by <a href="{PROJECT_URL}" rel="noopener">'
               'community-ev-charging</a>, open source.</p>')
@@ -82,10 +88,10 @@ ORDER_ID = re.compile(r"^[A-Z0-9]{10,40}$")
 SESSION_ID = re.compile(r"^[A-Za-z0-9_-]{16,40}$")
 
 STATUS_TEXT = {
-    "CREATED": "Waiting for PayPal approval.",
+    "CREATED": "Waiting for {provider} approval.",
     "AUTHORISED": "Payment held. Starting the charger…",
     "CHARGING": "Charging.",
-    "CAPTURE_PENDING": "Charging finished. PayPal is completing the payment.",
+    "CAPTURE_PENDING": "Charging finished. {provider} is completing the payment.",
     "CAPTURED": "Charging finished and paid. Thank you!",
     "VOIDED": "Finished. You have not been charged, and the hold has been released.",
     "ABANDONED": "This payment was not completed. You have not been charged.",
@@ -102,11 +108,9 @@ def _label(name: str) -> str:
     return LABELS.get(name, name.replace("_", " ").replace("-", " ").capitalize())
 
 
-def _pence(price: Decimal) -> str:
-    return f"{(price * 100).normalize():f}p"
-
-
-def _rates_table(tariff: Tariff, solar_on: bool, now_band: str | None) -> str:
+def _rates_table(tariff: Tariff, solar_on: bool, now_band: str | None,
+                 settings: config.Settings | None = None) -> str:
+    _pence = (settings or config.Settings()).unit_price
     rows = []
     rates = sorted(tariff.rates(), key=lambda r: r[1], reverse=True)   # dearest first: peak, then off-peak
     # The band covering most of the day is "the rest of the time": no hours listed.
@@ -122,7 +126,7 @@ def _rates_table(tariff: Tariff, solar_on: bool, now_band: str | None) -> str:
                     f"<td class=small>when there is spare solar power{mark}</td></tr>")
     if tariff.session_fee:
         rows.append(f"<tr><th>Plus</th><td>{_pence(tariff.session_fee)} per charge</td>"
-                    "<td class=small>(the PayPal fee)</td></tr>")
+                    f"<td class=small>(the {(settings or config.Settings()).provider_name} fee)</td></tr>")
     return f"<table class=rates>{''.join(rows)}</table>"
 
 
@@ -142,11 +146,12 @@ def _log_info() -> None:
         ours.setLevel(logging.INFO)
 
 
-def create_app(settings: config.Settings | None = None, paypal: PayPal | None = None) -> FastAPI:
+def create_app(settings: config.Settings | None = None, paypal: PayPal | None = None,
+               stripe: Stripe | None = None) -> FastAPI:
     _log_info()
     settings = settings or config.from_env()
     db = DB(settings.db_path)
-    payments = Payments(settings, db, paypal or PayPal(settings))
+    payments = Payments(settings, db, paypal or PayPal(settings), stripe or Stripe(settings))
     csms = CSMS(settings, db, payments)
     remote_started: set[str] = set()
     page = functools.partial(_page, settings=settings)
@@ -154,7 +159,7 @@ def create_app(settings: config.Settings | None = None, paypal: PayPal | None = 
     @contextlib.asynccontextmanager
     async def lifespan(app: FastAPI):
         app.state.ocpp_server = await csms.serve()
-        task = asyncio.create_task(_housekeeping(payments, csms)) if settings.paypal_configured else None
+        task = asyncio.create_task(_housekeeping(payments, csms)) if settings.payments_configured else None
         yield
         if task:
             task.cancel()
@@ -165,6 +170,17 @@ def create_app(settings: config.Settings | None = None, paypal: PayPal | None = 
     app.state.payments = payments
     app.state.csms = csms
     add_admin(app, settings, db, payments, csms, page)
+
+    async def start_charging(s: dict) -> bool:
+        """Once a hold is in place: tell the charger to start, at most once per session.
+        If it refuses, release the hold straight away. False when it did not start."""
+        if s["status"] != "AUTHORISED" or s["id"] in remote_started:
+            return True
+        remote_started.add(s["id"])
+        if await csms.remote_start(s):
+            return True
+        await asyncio.to_thread(payments.cancel, s["id"], "charger did not accept the start")
+        return False
 
     @app.exception_handler(PaymentError)
     async def payment_error(_: Request, e: PaymentError):
@@ -193,16 +209,17 @@ def create_app(settings: config.Settings | None = None, paypal: PayPal | None = 
                         f'<td class=small>{html.escape(power)}</td><td>{what}</td></tr>')
         body = (f"{_note(settings.page_note)}<h2>Sockets</h2><table class=sockets>{''.join(rows)}</table>"
                 "<p class=small>Plug in, then open the socket's page (or scan its QR code) to pay.</p>"
-                f"<h2>Prices</h2>{RATE_RULE}{_rates_table(settings.tariff, db.solar_active(), _now_band(settings))}{HOW_IT_WORKS}"
-                f"<p>You can hold {', '.join(f'£{h:.0f}' for h in settings.hold_options)}. "
-                f"Pay by {'debit or credit card' if settings.payment_methods == 'card' else 'PayPal or card'}. {_privacy(settings)}</p>")
+                f"<h2>Prices</h2>{RATE_RULE}{_rates_table(settings.tariff, db.solar_active(), _now_band(settings), settings)}"
+                f"{_how_it_works(settings)}"
+                f"<p>You can hold {', '.join(settings.money(h, 0) for h in settings.hold_options)}. "
+                f"Pay by {_pay_by(settings)}. {_privacy(settings)}</p>")
         return page("EV charging", body, refresh=30, note_at_foot=False)
 
     @app.get("/pay/{connector}", response_class=HTMLResponse)
     def pay_page(connector: str):
         if connector not in settings.connectors:
             raise HTTPException(404)
-        if not settings.paypal_configured:
+        if not settings.payments_configured:
             return page("EV charging", "<p>Payments are not set up yet.</p>")
         title = f"Socket {connector}"
         state = csms.socket_state(connector)
@@ -214,8 +231,9 @@ def create_app(settings: config.Settings | None = None, paypal: PayPal | None = 
             return page(title, back=True, subtitle=settings.power_label(connector), body="<p>This socket is out of service at the moment. Sorry.</p>", refresh=30)
         if state != READY:
             return page(title, back=True, subtitle=settings.power_label(connector), body="<p><strong>Plug your car in first.</strong> This page will then let you pay.</p>"
-                         + RATE_RULE + _rates_table(settings.tariff, db.solar_active(), _now_band(settings)), refresh=5)
-        return page(title, back=True, subtitle=settings.power_label(connector), body=_pay_body(settings, connector, db.solar_active()))
+                         + RATE_RULE + _rates_table(settings.tariff, db.solar_active(), _now_band(settings), settings), refresh=5)
+        body = (_checkout_body if settings.payment_provider == "stripe" else _pay_body)(settings, connector, db.solar_active())
+        return page(title, back=True, subtitle=settings.power_label(connector), body=body)
 
     @app.post("/pay/api/orders")
     def create_order(req: OrderRequest):
@@ -224,6 +242,25 @@ def create_app(settings: config.Settings | None = None, paypal: PayPal | None = 
             raise PaymentError(409, "Please plug your car in first")
         _, order_id = payments.create_order(req.connector, req.hold)
         return {"orderID": order_id}
+
+    @app.post("/pay/api/checkout", response_class=HTMLResponse)
+    def create_checkout(request: Request, connector: str = Form(...), hold: Decimal | None = Form(None)):
+        """Stripe: a plain form post (no script on our page), answered with a redirect to
+        Stripe's own payment page. Errors come back as a page the driver can read."""
+        if settings.payment_provider != "stripe" or not settings.stripe_configured:
+            raise HTTPException(503, "Payments are not set up yet")
+        if connector not in settings.connectors:
+            raise HTTPException(404)
+        title = f"Socket {connector}"
+        if csms.socket_state(connector) != READY:
+            return page(title, back=True, body="<p><strong>Please plug your car in first.</strong> "
+                        f'Then <a href="/pay/{html.escape(connector)}">try again</a>.</p>', refresh=5)
+        try:
+            _, url = payments.create_checkout(connector, hold, str(request.base_url))
+        except PaymentError as e:
+            return HTMLResponse(page(title, back=True, body=f"<p>{html.escape(str(e))}</p>"
+                                     f'<p><a href="/pay/{html.escape(connector)}">Back</a></p>'), status_code=e.code)
+        return RedirectResponse(url, status_code=303)
 
     @app.post("/pay/api/orders/{order_id}/authorize")
     async def authorize(order_id: str):
@@ -249,34 +286,49 @@ def create_app(settings: config.Settings | None = None, paypal: PayPal | None = 
         return RedirectResponse(f"/pay/session/{sid}", status_code=303)
 
     @app.get("/pay/session/{sid}", response_class=HTMLResponse)
-    def session_page(sid: str):
+    async def session_page(sid: str):
         s = db.session(sid) if SESSION_ID.match(sid) else None
         if not s:
             raise HTTPException(404)
+        notice = ""
+        if s["status"] == "CREATED" and s["payment_method"] == "stripe" and s["stripe_checkout_id"]:
+            # Back from Stripe's page, possibly before the webhook: see whether the hold is in place.
+            try:
+                s = await asyncio.to_thread(payments.confirm_checkout, s["stripe_checkout_id"])
+            except PaymentError as e:
+                notice = f"<p>{html.escape(str(e))}</p>"
+                s = db.session(sid)
+        # Stripe only: PayPal sessions are started by the authorize call the buttons make.
+        if s["status"] == "AUTHORISED" and s["payment_method"] == "stripe" and not await start_charging(s):
+            notice = ("<p>The charger did not start, so the payment has been cancelled. "
+                      "You have not been charged.</p>")
+            s = db.session(sid)
         rows = [("Socket", s["connector"])]
         for name, part in (json.loads(s["breakdown"]) if s["breakdown"] else {}).items():
             if name == FEE:
-                rows.append((_label(name), f"£{part['cost']}"))
+                rows.append((_label(name), settings.money(part["cost"])))
             else:
-                rows.append((_label(name), f"{part['wh'] / 1000:.2f} kWh at {_pence(Decimal(part['price']))} = £{part['cost']}"))
+                rows.append((_label(name), f"{part['wh'] / 1000:.2f} kWh at {settings.unit_price(Decimal(part['price']))}"
+                                           f" = {settings.money(part['cost'])}"))
         if s["energy_wh"] is not None:
             rows.append(("Energy", f"{s['energy_wh'] / 1000:.2f} kWh"))
         tx = db.transaction_for_session(sid) if s["status"] == "CHARGING" else None
         if tx:
             readings = db.readings(tx["id"])
             so_far, _ = payments.running_cost(sid, readings)
-            rows.append(("So far", f"{(readings[-1][1] - readings[0][1]) / 1000:.2f} kWh, £{so_far}"))
+            rows.append(("So far", f"{(readings[-1][1] - readings[0][1]) / 1000:.2f} kWh, {settings.money(so_far)}"))
         if s["amount_charged"] is not None:
-            rows.append(("Charged", f"£{s['amount_charged']}"))
+            rows.append(("Charged", settings.money(s["amount_charged"])))
         elif s["status"] in ("AUTHORISED", "CHARGING"):
-            rows.append(("Held", f"£{s['hold_amount']} (you pay only for what you use)"))
+            rows.append(("Held", f"{settings.money(s['hold_amount'])} (you pay only for what you use)"))
         table = "".join(f"<tr><th>{html.escape(k)}</th><td>{html.escape(v)}</td></tr>" for k, v in rows)
         live = s["status"] in ("CREATED", "AUTHORISED", "CHARGING", "CAPTURE_PENDING")
-        body = f"<p><strong>{html.escape(STATUS_TEXT.get(s['status'], s['status']))}</strong></p><table>{table}</table>"
+        text = STATUS_TEXT.get(s["status"], s["status"]).format(provider=settings.provider_name)
+        body = f"{notice}<p><strong>{html.escape(text)}</strong></p><table>{table}</table>"
         if s["status"] == "FAILED":
             body += f"<p>{html.escape(settings.support_contact or 'Please contact the owner of this charger.')}</p>"
         if not s["breakdown"]:
-            body += "<h2>Rates</h2>" + _rates_table(session_tariff(s), False, None)
+            body += "<h2>Rates</h2>" + _rates_table(session_tariff(s), False, None, settings)
         if tx:
             body += (f'<form method="post" action="/pay/session/{sid}/stop">'
                      '<button class=stop type="submit">Stop charging</button></form>')
@@ -309,6 +361,29 @@ def create_app(settings: config.Settings | None = None, paypal: PayPal | None = 
         log.info("webhook %s %s: %s", event.get("id"), event.get("event_type"), note)
         return {"ok": True}
 
+    @app.post("/webhooks/stripe")
+    async def stripe_webhook(request: Request):
+        if not settings.stripe_webhook_secret:
+            raise HTTPException(503, "webhook not configured")
+        raw = await request.body()
+        if not verify_signature(raw, request.headers.get("stripe-signature", ""), settings.stripe_webhook_secret):
+            log.warning("stripe webhook failed verification")
+            raise HTTPException(400)
+        try:
+            event = json.loads(raw)
+        except ValueError:
+            raise HTTPException(400) from None
+        try:
+            note, s = await asyncio.to_thread(payments.handle_stripe_webhook, event)
+        except PaymentError as e:
+            if e.code >= 500:
+                raise HTTPException(503) from None   # Stripe redelivers
+            note, s = str(e), None
+        if s:
+            await start_charging(s)
+        log.info("stripe webhook %s %s: %s", event.get("id"), event.get("type"), note)
+        return {"ok": True}
+
     return app
 
 
@@ -327,8 +402,49 @@ def _now_band(settings: config.Settings) -> str:
 
 
 def _need_paypal(settings: config.Settings) -> None:
-    if not settings.paypal_configured:
+    if settings.payment_provider != "paypal" or not settings.paypal_configured:
         raise HTTPException(503, "Payments are not set up yet")
+
+
+def _pay_by(settings: config.Settings) -> str:
+    if settings.payment_provider == "stripe":
+        return "debit or credit card, Apple Pay or Google Pay"
+    return "debit or credit card" if settings.payment_methods == "card" else "PayPal or card"
+
+
+def _hold_rows(settings: config.Settings) -> tuple[str, str, int]:
+    """The hold choices: one row per amount, how many kWh it covers at each rate, dearest first."""
+    tariff = settings.tariff
+    rates = sorted(((n, p) for n, p, _ in tariff.rates()), key=lambda r: r[1], reverse=True)
+    head = "".join(f"<th>{html.escape(_label(n))}</th>" for n, _ in rates)
+    choices = "".join(
+        f'<tr class=hold><td><label><input type="radio" name="hold" value="{h:.2f}"{" checked" if h == settings.hold_default else ""}> '
+        f'{settings.money(h, 0)}</label></td>' + "".join(f"<td>{settings.kwh_for(h, p)} kWh</td>" for _, p in rates) + "</tr>"
+        for h in settings.hold_options
+    )
+    return head, choices, len(rates)
+
+
+def _checkout_body(settings: config.Settings, connector: str, solar_on: bool) -> str:
+    """Stripe: choose the hold, then a plain form post that redirects to Stripe Checkout."""
+    head, choices, ncols = _hold_rows(settings)
+    return f"""
+{RATE_RULE}
+{_rates_table(settings.tariff, solar_on, _now_band(settings), settings)}
+{_how_it_works(settings)}
+<form method="post" action="/pay/api/checkout">
+<input type="hidden" name="connector" value="{html.escape(connector)}">
+<fieldset aria-label="Amount to hold">
+<table class=holds>
+<tr class=top><th>Amount to hold</th><th colspan={ncols}>Estimated max charge</th></tr>
+<tr><th></th>{head}</tr>{choices}</table>
+<p class=small>The energy each amount covers, if it is all at that rate.</p></fieldset>
+<p class=small>Pay by {_pay_by(settings)} on Stripe's secure page. {_privacy(settings)}</p>
+<button class=pay type="submit">Continue to payment</button>
+</form>
+<script>
+document.querySelectorAll("tr.hold").forEach(tr => tr.addEventListener("click", () => tr.querySelector("input").checked = true));
+</script>"""
 
 
 def _pay_body(settings: config.Settings, connector: str, solar_on: bool) -> str:
@@ -339,21 +455,14 @@ def _pay_body(settings: config.Settings, connector: str, solar_on: bool) -> str:
     tariff = settings.tariff
     now_band = _now_band(settings)
     card_only = settings.payment_methods == "card"
-    # One row per hold: how many kWh it covers at each rate, dearest rate first.
-    rates = sorted(((n, p) for n, p, _ in tariff.rates()), key=lambda r: r[1], reverse=True)
-    head = "".join(f"<th>{html.escape(_label(n))}</th>" for n, _ in rates)
-    choices = "".join(
-        f'<tr class=hold><td><label><input type="radio" name="hold" value="{h:.2f}"{" checked" if h == settings.hold_default else ""}> '
-        f'£{h:.0f}</label></td>' + "".join(f"<td>{settings.kwh_for(h, p)} kWh</td>" for _, p in rates) + "</tr>"
-        for h in settings.hold_options
-    )
+    head, choices, ncols = _hold_rows(settings)
     return f"""
 {RATE_RULE}
-{_rates_table(tariff, solar_on, now_band)}
-{HOW_IT_WORKS}
+{_rates_table(tariff, solar_on, now_band, settings)}
+{_how_it_works(settings)}
 <fieldset aria-label="Amount to hold">
 <table class=holds>
-<tr class=top><th>Amount to hold</th><th colspan={len(rates)}>Estimated max charge</th></tr>
+<tr class=top><th>Amount to hold</th><th colspan={ncols}>Estimated max charge</th></tr>
 <tr><th></th>{head}</tr>{choices}</table>
 <p class=small>The energy each amount covers, if it is all at that rate.</p></fieldset>
 <p class=small>{"Pay by debit or credit card." if card_only else
@@ -429,6 +538,7 @@ def _page(title: str, body: str, settings: config.Settings, refresh: int | None 
  table.sessions {{ font-size: .9rem; border-collapse: collapse; }} table.sessions td {{ padding: .3rem .6rem .3rem 0; border-top: 1px solid rgba(128,128,128,.3); }}
  .powered {{ margin-top: 1.5rem; opacity: .8; }} .powered a {{ color: inherit; }}
  .note {{ font-size: .9rem; margin-top: 1.5rem; }}
+ button.pay {{ font: inherit; font-weight: 600; padding: .8rem 1.6rem; border: 0; border-radius: 8px; background: var(--accent); color: #fff; width: 100%; }}
  button.stop {{ font: inherit; font-weight: 600; padding: .7rem 1.4rem; border: 0; border-radius: 8px; background: #b00020; color: #fff; }}
  th {{ text-align: left; padding-right: 1rem; font-weight: 600; }} #msg {{ color: #a00; }}
  @media (prefers-color-scheme: dark) {{ :root {{ --accent-ui: color-mix(in srgb, var(--accent) 50%, white); }} body {{ color: #eee; background: #111; }} .small {{ color: #aaa; }} #msg {{ color: #f88; }} }}

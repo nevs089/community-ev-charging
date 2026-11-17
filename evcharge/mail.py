@@ -25,13 +25,16 @@ from decimal import Decimal
 from email.message import EmailMessage
 from email.utils import formatdate, make_msgid
 
+from .config import SYMBOLS
+
 log = logging.getLogger(__name__)
 
 TIMEOUT = 30.0
 
 
 def _money(currency: str, value: Decimal) -> str:
-    return f"£{value:.2f}" if currency == "GBP" else f"{value:.2f} {currency}"
+    symbol = SYMBOLS.get(currency)
+    return f"{symbol}{value:.2f}" if symbol else f"{value:.2f} {currency}"
 
 
 def charged_body(settings, session: dict, parts: list[str]) -> tuple[str, str]:

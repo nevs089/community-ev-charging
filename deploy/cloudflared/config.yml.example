@@ -11,9 +11,9 @@ tunnel: TUNNEL_ID
 credentials-file: /etc/cloudflared/TUNNEL_ID.json
 
 ingress:
-  # Payment pages, their static assets, and the PayPal webhook. Nothing else.
+  # Payment pages, their static assets, and the payment provider's webhook. Nothing else.
   - hostname: ev.example.org
-    path: ^/(pay|static|webhooks/paypal)(/.*)?$
+    path: ^/(pay|static|webhooks/paypal|webhooks/stripe)(/.*)?$
     service: http://app:8080
 
   # The bare hostname goes to the payment landing page, so a QR code can use it.

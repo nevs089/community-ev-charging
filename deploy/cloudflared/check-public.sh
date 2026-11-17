@@ -36,6 +36,13 @@ expect 404 /ocpp/CP1/x
 expect 404 /payx
 expect 404 /webhooks/other
 
+# The Stripe webhook: an unsigned POST must reach the app and be refused there
+# (400 bad signature; 503 when no STRIPE_WEBHOOK_SECRET is set). 404 means the edge blocks it.
+got=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 -X POST -H "Content-Type: application/json" \
+      -d '{}' "$base/webhooks/stripe")
+if [[ "$got" == "400" || "$got" == "503" ]]; then printf 'ok    %s  %s\n' "$got" "/webhooks/stripe (unsigned POST)"
+else printf 'FAIL  %s  %s (want 400 or 503 from the app)\n' "$got" "/webhooks/stripe (unsigned POST)"; fail=1; fi
+
 # The charger route: a WebSocket handshake with no password must reach the app and get its 401.
 # (A missing password doesn't count towards the app's lockout, so this is safe to repeat.)
 got=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 --http1.1 \

@@ -12,6 +12,8 @@ PAYPAL_API = {
     "sandbox": "https://api-m.sandbox.paypal.com",
     "live": "https://api-m.paypal.com",
 }
+PROVIDERS = ("paypal", "stripe")
+SYMBOLS = {"GBP": "£", "EUR": "€", "USD": "$"}
 
 
 @dataclass(frozen=True)
@@ -20,6 +22,14 @@ class Settings:
     paypal_client_id: str = ""
     paypal_client_secret: str = ""
     paypal_webhook_id: str = ""
+    # Which payment provider takes the money: "paypal" (Orders v2, authorise then capture) or
+    # "stripe" (Checkout with capture_method=manual, see stripe.py and docs/payments/stripe.md).
+    payment_provider: str = "paypal"
+    # A restricted key is enough: write access to Checkout Sessions and PaymentIntents.
+    stripe_secret_key: str = ""
+    stripe_webhook_secret: str = ""         # whsec_..., from the webhook endpoint
+    # Pinned so a change to the account's default version can't change what the code reads.
+    stripe_api_version: str = "2024-06-20"
     currency: str = "GBP"
     tariff: Tariff = Tariff.flat(Decimal("0.45"))
     # Holds the driver can choose from, in display order.
@@ -135,6 +145,35 @@ class Settings:
     def paypal_configured(self) -> bool:
         return bool(self.paypal_client_id and self.paypal_client_secret)
 
+    @property
+    def stripe_configured(self) -> bool:
+        return bool(self.stripe_secret_key)
+
+    @property
+    def payments_configured(self) -> bool:
+        """The selected provider has the keys it needs to take a payment."""
+        return self.stripe_configured if self.payment_provider == "stripe" else self.paypal_configured
+
+    @property
+    def provider_name(self) -> str:
+        return "Stripe" if self.payment_provider == "stripe" else "PayPal"
+
+    @property
+    def currency_symbol(self) -> str:
+        return SYMBOLS.get(self.currency, "")
+
+    def money(self, value: Decimal | float | str, places: int = 2) -> str:
+        """An amount for people to read: £4.80, €4.80, or 4.80 CHF without a known symbol."""
+        v = f"{Decimal(str(value)):.{places}f}"
+        return f"{self.currency_symbol}{v}" if self.currency_symbol else f"{v} {self.currency}"
+
+    def unit_price(self, price: Decimal) -> str:
+        """A price per kWh: in pence for GBP (45p), as an amount otherwise (€0.40)."""
+        if self.currency == "GBP":
+            return f"{(price * 100).normalize():f}p"
+        places = max(2, -Decimal(price).normalize().as_tuple().exponent)
+        return self.money(price, places)
+
     def kwh_for(self, hold: Decimal, price: Decimal) -> int:
         """Whole kWh a hold covers if every kWh is at `price`, after the session fee.
         The charger itself is stopped when the running cost reaches the hold."""
@@ -189,7 +228,11 @@ def from_env(env: dict[str, str] | None = None) -> Settings:
         paypal_client_id=env.get("PAYPAL_CLIENT_ID", ""),
         paypal_client_secret=env.get("PAYPAL_CLIENT_SECRET", ""),
         paypal_webhook_id=env.get("PAYPAL_WEBHOOK_ID", ""),
-        currency=env.get("CURRENCY", d.currency),
+        payment_provider=env.get("PAYMENT_PROVIDER", d.payment_provider).strip().lower(),
+        stripe_secret_key=env.get("STRIPE_SECRET_KEY", "").strip(),
+        stripe_webhook_secret=env.get("STRIPE_WEBHOOK_SECRET", "").strip(),
+        stripe_api_version=env.get("STRIPE_API_VERSION", "").strip() or d.stripe_api_version,
+        currency=env.get("CURRENCY", d.currency).strip().upper(),
         tariff=_tariff(env),
         hold_options=_holds(env.get("HOLD_OPTIONS") or env.get("HOLD_AMOUNT") or ",".join(map(str, d.hold_options))),
         connectors=tuple(c.strip() for c in env.get("CONNECTORS", ",".join(d.connectors)).split(",") if c.strip()),
@@ -255,4 +298,12 @@ def from_env(env: dict[str, str] | None = None) -> Settings:
         raise ValueError("PAYMENT_METHODS must be card or all")
     if s.paypal_env not in PAYPAL_API:
         raise ValueError(f"PAYPAL_ENV must be one of {sorted(PAYPAL_API)}")
+    if s.payment_provider not in PROVIDERS:
+        raise ValueError(f"PAYMENT_PROVIDER must be one of {', '.join(PROVIDERS)}")
+    if s.stripe_secret_key and not s.stripe_secret_key.startswith(("sk_", "rk_")):
+        raise ValueError("STRIPE_SECRET_KEY must be a secret (sk_...) or restricted (rk_...) key")
+    if s.stripe_webhook_secret and not s.stripe_webhook_secret.startswith("whsec_"):
+        raise ValueError("STRIPE_WEBHOOK_SECRET must start with whsec_")
+    if not re.fullmatch(r"[A-Z]{3}", s.currency):
+        raise ValueError("CURRENCY must be a three-letter code such as GBP or EUR")
     return s

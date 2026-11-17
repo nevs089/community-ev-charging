@@ -19,6 +19,9 @@ energy they used and releases the rest.
   library): starts the charger after payment, reads the meter every minute, stops it before the hold runs out.
 - **PayPal Checkout with authorise-then-capture**: card-only guest checkout by
   default, so drivers need no account and the fee is the low guest-card rate.
+- **Or Stripe Checkout** (`PAYMENT_PROVIDER=stripe`, this fork): the same hold-then-capture
+  with `capture_method=manual`, cards incl. Apple Pay / Google Pay, any currency
+  (`CURRENCY=EUR`). See [docs/payments/stripe.md](docs/payments/stripe.md).
 - **Time-of-use pricing**: peak and off-peak bands in local time, each kWh priced
   by when it was delivered, plus an optional per-charge fee and an optional
   solar-surplus rate.

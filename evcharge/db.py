@@ -19,10 +19,10 @@ CREATE TABLE IF NOT EXISTS sessions (
     tariff                  TEXT,               -- Tariff.to_json(), what the session is billed on
     breakdown               TEXT,               -- per-rate kWh and cost at settlement
     id_tag                  TEXT,               -- what the charger is started with (OCPP idTag)
-    payment_method          TEXT,               -- 'paypal' (NULL in old rows) or 'manual' (admin, no payment)
+    payment_method          TEXT,               -- 'paypal' (NULL in old rows), 'stripe' or 'manual' (admin, no payment)
     limit_wh                INTEGER,            -- manual sessions limited by energy rather than money
     note                    TEXT,               -- who/why, for manual sessions
-    paypal_fee              TEXT,               -- what PayPal kept, from the capture
+    paypal_fee              TEXT,               -- what the payment provider kept (PayPal or Stripe), from the capture
     paypal_order_id         TEXT UNIQUE,
     paypal_authorization_id TEXT,
     authorization_expires   TEXT,
@@ -72,7 +72,7 @@ CREATE TABLE IF NOT EXISTS solar_periods (
     ended_at   TEXT                             -- off; NULL while still on
 );
 CREATE TABLE IF NOT EXISTS webhook_events (
-    id          TEXT PRIMARY KEY,               -- PayPal event id; redeliveries are ignored
+    id          TEXT PRIMARY KEY,               -- PayPal or Stripe event id; redeliveries are ignored
     event_type  TEXT NOT NULL,
     resource_id TEXT,
     received_at TEXT NOT NULL
@@ -100,7 +100,9 @@ class DB:
         added = {"tariff": "TEXT", "breakdown": "TEXT", "id_tag": "TEXT",   # added after the first deploy
                  "payment_method": "TEXT", "limit_wh": "INTEGER", "note": "TEXT", "paypal_fee": "TEXT",
                  # Only until the charge settles and the receipt is sent, then cleared.
-                 "payer_email": "TEXT"}
+                 "payer_email": "TEXT",
+                 # Stripe: the Checkout Session the driver pays on, and its PaymentIntent (the hold).
+                 "stripe_checkout_id": "TEXT", "stripe_payment_intent_id": "TEXT"}
         for col, kind in added.items():
             if col not in cols:
                 self._conn.execute(f"ALTER TABLE sessions ADD COLUMN {col} {kind}")
@@ -109,6 +111,8 @@ class DB:
         # Indexes on added columns go after the migration, or an old database fails here.
         self._conn.execute("CREATE INDEX IF NOT EXISTS sessions_id_tag ON sessions (id_tag)")
         self._conn.execute("CREATE INDEX IF NOT EXISTS transactions_ocpp ON transactions (charge_point, ocpp_tx_id)")
+        self._conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS sessions_stripe_checkout ON sessions (stripe_checkout_id)")
+        self._conn.execute("CREATE INDEX IF NOT EXISTS sessions_stripe_pi ON sessions (stripe_payment_intent_id)")
         self.lock = threading.RLock()
 
     def _one(self, sql: str, *args: Any) -> dict | None:
@@ -145,6 +149,12 @@ class DB:
 
     def session_by_authorization(self, auth_id: str) -> dict | None:
         return self._one("SELECT * FROM sessions WHERE paypal_authorization_id = ?", auth_id)
+
+    def session_by_checkout(self, checkout_id: str) -> dict | None:
+        return self._one("SELECT * FROM sessions WHERE stripe_checkout_id = ?", checkout_id)
+
+    def session_by_payment_intent(self, payment_intent_id: str) -> dict | None:
+        return self._one("SELECT * FROM sessions WHERE stripe_payment_intent_id = ?", payment_intent_id)
 
     def sessions_with_status(self, *statuses: str, connector: str | None = None) -> list[dict]:
         sql = f"SELECT * FROM sessions WHERE status IN ({', '.join('?' * len(statuses))})"

@@ -441,7 +441,7 @@ class CSMS:
             self._stopping.add(t["id"])
             # Not awaited: we're inside the charger's MeterValues handler, and the
             # library reads the charger's reply to our call only after it returns.
-            asyncio.create_task(self.remote_stop(s["id"], f"limit reached (£{cost})"))
+            asyncio.create_task(self.remote_stop(s["id"], f"limit reached ({self.settings.money(cost)})"))
 
     async def settle(self, tx: int, final_cost: bool = False) -> None:
         t = self.db.transaction(tx)
@@ -489,8 +489,8 @@ class CSMS:
         solar = self.db.solar_active() and tariff.solar_price is not None
         price = tariff.solar_price if solar else tariff.band_at(at).price
         if final:
-            return cost, price, f"{kwh:.2f} kWh, total £{cost:.2f}" + (" (no energy, nothing taken)" if cost == 0 else "")
-        return cost, price, f"{kwh:.2f} kWh, £{cost:.2f} so far. Now {price * 100:.0f}p/kWh."
+            return cost, price, f"{kwh:.2f} kWh, total {self.settings.money(cost)}" + (" (no energy, nothing taken)" if cost == 0 else "")
+        return cost, price, f"{kwh:.2f} kWh, {self.settings.money(cost)} so far. Now {self.settings.unit_price(price)}/kWh."
 
     async def _cost_message(self, cp_id: str, message_id: str, data: dict) -> None:
         cp = self.points.get(cp_id)
@@ -536,7 +536,7 @@ class CSMS:
             cost, text = Decimal(0), f"{kwh:.2f} kWh. No charge. Thank you!"
         else:
             cost = Decimal(s["amount_charged"] or 0)
-            text = f"{kwh:.2f} kWh, total £{cost:.2f}" + (" (no energy, nothing taken)" if cost == 0 else "")
+            text = f"{kwh:.2f} kWh, total {self.settings.money(cost)}" + (" (no energy, nothing taken)" if cost == 0 else "")
         data = {"transactionId": tx, "cost": float(cost), "priceText": text}
         if self.settings.public_url:
             data["qrCodeText"] = f"{self.settings.public_url}/pay/session/{s['id']}"
